@@ -1,5 +1,7 @@
 package org.salesforce.demo;
 
+import com.google.protobuf.ByteString;
+import com.salesforce.eventbus.protobuf.*;
 import io.grpc.ClientInterceptor;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
@@ -7,21 +9,25 @@ import io.grpc.Metadata;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.MetadataUtils;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import io.grpc.stub.StreamObserver;
+import io.grpc.stub.StreamObservers;
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericDatumWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.generic.GenericRecordBuilder;
+import org.apache.avro.io.BinaryEncoder;
+import org.apache.avro.io.EncoderFactory;
 import org.salesforce.demo.auth.AuthenticationHelper;
 import org.salesforce.demo.auth.AuthenticationHelper.AuthenticationException;
 import org.salesforce.demo.utils.Config;
 import org.salesforce.demo.auth.SalesforceSession;
-
-import com.salesforce.eventbus.protobuf.PubSubGrpc;
-import com.salesforce.eventbus.protobuf.SchemaInfo;
-import com.salesforce.eventbus.protobuf.SchemaRequest;
-import com.salesforce.eventbus.protobuf.TopicInfo;
-import com.salesforce.eventbus.protobuf.TopicRequest;
 
 public class PubSubApiClient {
 	private static final Logger logger = Logger.getLogger(PubSubApiClient.class.getName());
@@ -49,6 +55,9 @@ public class PubSubApiClient {
 			metadata.put(Metadata.Key.of("accesstoken", Metadata.ASCII_STRING_MARSHALLER), session.getAccessToken());
 			metadata.put(Metadata.Key.of("instanceurl", Metadata.ASCII_STRING_MARSHALLER), session.getInstanceUrl());
 			metadata.put(Metadata.Key.of("tenantid", Metadata.ASCII_STRING_MARSHALLER), session.getOrgId());
+
+			System.out.println(metadata);
+
 			// Inject metadata in all client requests with an interceptor
 			ClientInterceptor interceptor = MetadataUtils.newAttachHeadersInterceptor(metadata);
 			channel = ManagedChannelBuilder.forTarget(config.getPubSubEndpoint()).intercept(interceptor).build();
@@ -84,17 +93,20 @@ public class PubSubApiClient {
 		}
 	}
 
-	public Schema retrieveTopicSchema(String topicName) throws PubSubException {
+	public SchemaInfo retrieveTopicSchemaInfo(String topicName) throws PubSubException {
 		TopicInfo topic = retrieveTopic(topicName);
 		logger.info("PubSub API: retrieving schema for topic " + topicName + "...");
 		SchemaRequest request = SchemaRequest.newBuilder().setSchemaId(topic.getSchemaId()).build();
 		try {
-			SchemaInfo response = blockingStub.getSchema(request);
-			return new Schema.Parser().parse(response.getSchemaJson());
+			return blockingStub.getSchema(request);
 		} catch (StatusRuntimeException e) {
 			throw new PubSubException(
 					"Failed to retrieve schema for topic " + topic.getTopicName() + ": " + e.getMessage(), e);
 		}
+	}
+
+	public Schema retrieveTopicSchema(String topicName) throws PubSubException {
+		return new Schema.Parser().parse(retrieveTopicSchemaInfo(topicName).getSchemaJson());
 	}
 
 	public void subscribe(String topicName, Schema schema, int eventCountRequested) {
@@ -115,6 +127,38 @@ public class PubSubApiClient {
 		}
 	}
 
+	private ProducerEvent generateProducerEvent(SchemaInfo schemaInfo) throws IOException {
+		GenericRecord event = new GenericRecordBuilder(new Schema.Parser().parse(schemaInfo.getSchemaJson()))
+				.set("CreatedDate", System.currentTimeMillis() / 1000)
+				.set("CreatedById", "005b0000001BqtxAAC")
+//				.set("Loan_Application_Id__c", UUID.randomUUID().toString())
+				.set("Event_Name__c", "EventNameTest")
+				.build();
+
+		// Convert to byte array
+		GenericDatumWriter<GenericRecord> writer = new GenericDatumWriter<>(event.getSchema());
+		ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+		BinaryEncoder encoder = EncoderFactory.get().directBinaryEncoder(buffer, null);
+		writer.write(event, encoder);
+
+		return ProducerEvent.newBuilder().setSchemaId(schemaInfo.getSchemaId())
+				.setPayload(ByteString.copyFrom(buffer.toByteArray())).build();
+	}
+
+	public void publish(String topicName) throws IOException, PubSubException {
+		SchemaInfo schemaInfo = retrieveTopicSchemaInfo(topicName);
+		System.out.println("SchemaInfo: " + schemaInfo);
+
+		ProducerEvent e = generateProducerEvent(schemaInfo);
+		System.out.println("Generated ProducerEvent " + e);
+
+		PublishRequest request = PublishRequest.newBuilder().setTopicName(topicName).addEvents(e).build();
+		System.out.println("Generated PublishRequest " + request);
+
+		PublishResponse response = blockingStub.publish(request);
+		System.out.println("PublishRespons: " + response);
+	}
+
 	public void shutdown() {
 		this.isShuttingDown = true;
 	}
@@ -124,9 +168,15 @@ public class PubSubApiClient {
 		PubSubApiClient client = new PubSubApiClient();
 		try {
 			client.connect(config);
-			Schema topicSchema = client.retrieveTopicSchema(config.getPubSubTopicName());
-			client.subscribe(config.getPubSubTopicName(), topicSchema, config.getPubSubEventReceiveLimit());
-		} catch (Exception e) {
+//			Schema topicSchema = client.retrieveTopicSchema(config.getPubSubTopicName());
+//
+//			System.out.println(topicSchema);
+			System.out.println(client.retrieveTopic(config.getPubSubTopicName()));
+
+//			client.publish(config.getPubSubTopicName());
+//			client.subscribe(config.getPubSubTopicName(), topicSchema, config.getPubSubEventReceiveLimit());
+		} catch (Throwable e) {
+			System.out.println("BAHS" + e);
 			logger.log(Level.SEVERE, e.getMessage(), e);
 		} finally {
 			client.disconnect();
